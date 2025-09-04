@@ -10,8 +10,10 @@ def find_chunk_boundaries(
     """
     Chunk the file into parts that can be counted independently.
     May return fewer chunks if the boundaries end up overlapping.
+    e.g. 实际的分界点在12 20 分块的点为5 10 15 20 第一块和第二块有重叠，返回了相同的分界点，经过排序去重之后结果会少
     """
-    assert isinstance(split_special_token, bytes), "Must represent special token as a bytestring"
+    assert isinstance(split_special_token,
+                      bytes), "Must represent special token as a bytestring"
 
     # Get total file size in bytes
     file.seek(0, os.SEEK_END)
@@ -49,14 +51,14 @@ def find_chunk_boundaries(
     return sorted(set(chunk_boundaries))
 
 
-## Usage
-with open(..., "rb") as f:
-    num_processes = 4
-    boundaries = find_chunk_boundaries(f, num_processes, b"<|endoftext|>")
+# # Usage
+# with open(..., "rb") as f:
+#     num_processes = 4
+#     boundaries = find_chunk_boundaries(f, num_processes, b"<|endoftext|>")
 
-    # The following is a serial implementation, but you can parallelize this
-    # by sending each start/end pair to a set of processes.
-    for start, end in zip(boundaries[:-1], boundaries[1:]):
-        f.seek(start)
-        chunk = f.read(end - start).decode("utf-8", errors="ignore")
-        # Run pre-tokenization on your chunk and store the counts for each pre-token
+#     # The following is a serial implementation, but you can parallelize this
+#     # by sending each start/end pair to a set of processes.
+#     for start, end in zip(boundaries[:-1], boundaries[1:]):
+#         f.seek(start)
+#         chunk = f.read(end - start).decode("utf-8", errors="ignore")
+#         # Run pre-tokenization on your chunk and store the counts for each pre-token
