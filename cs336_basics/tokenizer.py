@@ -7,8 +7,7 @@ from collections import defaultdict
 import os
 import time
 import regex as re
-from pretokenization_example import find_chunk_boundaries
-from multiprocessing import Process, Queue
+from multiprocessing import Process, Queue, Pool
 import logging
 # 配置日志输出到文件和控制台
 logging.basicConfig(
@@ -197,7 +196,7 @@ class ProcessMessageBlock:
         return self
 
 
-def pretokenize(input_path: str, idx: int, blockes: list[int], queue: Queue, special_tokens) -> list[defaultdict]:
+def pretokenize(input_path: str, idx: int, blockes: list[int],  special_tokens) -> list[defaultdict]:
     """_summary_
 
     Args:
@@ -209,8 +208,7 @@ def pretokenize(input_path: str, idx: int, blockes: list[int], queue: Queue, spe
     try:
         if blockes is None:
             msg = f"worker-{idx} 需要处理的块为空，退出处理"
-            queue.put(message_block.set_msg(msg))
-            return
+            return message_block.set_msg(msg)
         logger.info(f"worker-{idx} 接收到任务，处理：{blockes}")
         with open(input_path, "rb") as f:
             # 1. 每个进程只需要处理一个块，需要首先使用special_tokens对文本进行分割成多段
@@ -221,8 +219,7 @@ def pretokenize(input_path: str, idx: int, blockes: list[int], queue: Queue, spe
             if len(blocks) == 0:
                 msg = f"worker-{idx} 需要处理的块为空，退出处理"
                 logger.info(msg)
-                queue.put(message_block.set_msg(msg))
-                return
+                return message_block.set_msg(msg)
             # 2. 分割成多段，对每段进行预分词，每段单独保存
             multi_block_word_freq = []
             for block in blocks:
@@ -234,12 +231,13 @@ def pretokenize(input_path: str, idx: int, blockes: list[int], queue: Queue, spe
                                     for byte in word.group().encode("utf-8")))] += 1
                 multi_block_word_freq.append(word_freq)
             msg = "处理成功"
-            queue.put(message_block.set_msg(
-                msg).set_pretokenized_chunks(multi_block_word_freq))
+            message_block.set_msg(
+                msg).set_pretokenized_chunks(multi_block_word_freq)
     except Exception as e:
         msg = f"处理过程异常:{e}"
         logger.info(f"worker-{idx} {msg}")
-        queue.put(message_block.set_msg(msg))
+        message_block.set_msg(msg)
+    return message_block
 
 
 def merge(word_freq: list[defaultdict[int]], pair: tuple[bytes, bytes], new_token: bytes, related_pair_count: defaultdict[int], new_token_freq: defaultdict[int]) -> tuple[list[defaultdict[int]]]:
@@ -277,7 +275,7 @@ def merge(word_freq: list[defaultdict[int]], pair: tuple[bytes, bytes], new_toke
     return new_word_freq
 
 
-def merge_blocks(idx: int, start: int, end: int, word_freqs: list[defaultdict[int]], pair: tuple[bytes, bytes], new_token: bytes, queue: Queue) -> tuple[int, int, list]:
+def merge_blocks(idx: int, start: int, end: int, word_freqs: list[defaultdict[int]], pair: tuple[bytes, bytes], new_token: bytes, ) -> tuple[int, int, list]:
     """_summary_
     单个子进程进行merge操作
     Args:
@@ -307,68 +305,50 @@ def merge_blocks(idx: int, start: int, end: int, word_freqs: list[defaultdict[in
         msg = f"worker-{idx} 处理过程异常:{e}"
         message_block.set_msg(msg)
     end_time = time.time()
-    queue.put(message_block.set_process_time(end_time-start_time))
+    return message_block.set_process_time(end_time-start_time)
 
 
-def BPE_train_merge(all_word_freq: list, pair: tuple[bytes, bytes], new_token: bytes, num_process: int):
+def BPE_train_merge(pool, all_word_freq: list, pair: tuple[bytes, bytes], new_token: bytes, num_processes: int):
     """
     多进程对所有块进行merge操作
     """
     # 1. 计算出每个进程需要处理的block，块数少于进程数使用块数个进程
     num_block = len(all_word_freq)
-    num_process = min(num_block, num_process)
-    if num_process == 0:
+    num_processes = min(num_block, num_processes)
+    if num_processes == 0:
         logger.info("进程数量或者总块数为0")
-    block_per_process = num_block // num_process
-    indices = [block_per_process*i for i in range(num_process+1)]
+    block_per_process = num_block // num_processes
+    indices = [block_per_process*i for i in range(num_processes+1)]
     indices[-1] = len(all_word_freq)
-    start_time = time.time()
     # 2. 调用多个进程进行merge操作 定位到问题：每次都重新创建进程，时间开销大
     # 2.1 创建消息队列
-    data_queue = Queue()
     # 2.2 创建多个进程，每个进程分配任务
-    processes = [Process(target=merge_blocks,  kwargs={
-        'idx': i,
-        'start': indices[i],
-        'end': indices[i+1],
-        'word_freqs': all_word_freq[indices[i]:indices[i+1]],
-        'pair': pair,
-        'new_token': new_token,
-        'queue': data_queue
-    }) for i in range(num_process)]
-    for process in processes:
-        process.start()
-
-    end_time = time.time()
-    logger.info(f"多进程merge启动时间：{end_time-start_time}")
+    results = pool.starmap(merge_blocks, [(i, indices[i], indices[i+1], all_word_freq[indices[i]:indices[i+1]], pair, new_token, )
+                                          for i in range(num_processes)])
     # 2.3 主进程将子进程返回结果更新到结果中
-    finish_num = 0
     all_word_freq = []
     near_bytes = defaultdict(int)
     new_token_freq = defaultdict(int)
-    while finish_num < num_process:
-        if data_queue.qsize() != 0:
-            message_block: ProcessMessageBlock = data_queue.get()
-            finish_num += 1
-            if message_block.merged_chunks is None:
-                msg = f"worker-{message_block.idx} merge失败"
-                logger.info(msg)
-            else:
-                all_word_freq.extend(message_block.merged_chunks)
-            sub_near_bytes = message_block.near_bytes
-            if sub_near_bytes is not None:
-                for word, freq in sub_near_bytes.items():
-                    near_bytes[word] += freq
-            sub_new_token_freq = message_block.new_token_freq
-            if sub_new_token_freq is not None:
-                for word, freq in sub_new_token_freq.items():
-                    new_token_freq[word] += freq
+    for message_block in results:
+        if message_block.merged_chunks is None:
+            msg = f"worker-{message_block.idx} merge失败"
+            logger.info(msg)
+        else:
+            all_word_freq.extend(message_block.merged_chunks)
+        sub_near_bytes = message_block.near_bytes
+        if sub_near_bytes is not None:
+            for word, freq in sub_near_bytes.items():
+                near_bytes[word] += freq
+        sub_new_token_freq = message_block.new_token_freq
+        if sub_new_token_freq is not None:
+            for word, freq in sub_new_token_freq.items():
+                new_token_freq[word] += freq
 
     # 3. 返回结果
     return (all_word_freq, near_bytes, new_token_freq)
 
 
-def BPE_train_pretokenize(input_path: str, special_tokens: list[str], num_processes: int = 4, ) -> list[defaultdict[int]]:
+def BPE_train_pretokenize(pool, input_path: str, special_tokens: list[str], num_processes: int = 4, ) -> list[defaultdict[int]]:
     """
     多进程完成BPE预分词
     """
@@ -378,25 +358,17 @@ def BPE_train_pretokenize(input_path: str, special_tokens: list[str], num_proces
     # 2. 使用多个进程并行处理，进行预分词
     # 2.1 为每个进程分配任务
     data_queue = Queue()
-    processes = [Process(target=pretokenize, args=(input_path,
-                                                   i, boundaries[i:min(i+2, len(boundaries))] if i < len(boundaries)-1 else None, data_queue), kwargs={
-        'special_tokens': special_tokens
-    }) for i in range(num_processes)]
-    # 2.2 启动子进程
-    for process in processes:
-        process.start()
+    results = pool.starmap(pretokenize, [(input_path,
+                                          i, boundaries[i:min(i+2, len(boundaries))] if i < len(boundaries)-1 else None,  special_tokens) for i in range(num_processes)])
     # 2.3 主进程监听消息队列，从消息队列中持续取出元素,子进程处理完成后会放入None，
-    finish_num = 0
     all_word_freq = []
-    while finish_num < num_processes:
-        if data_queue.qsize() != 0:
-            message_block: ProcessMessageBlock = data_queue.get()
-            finish_num += 1
-            if message_block.pretokenized_chunks is None:
-                msg = f"worker-{message_block.idx} 处理失败,info:{message_block.msg}"
-                logger.info(msg)
-            else:
-                all_word_freq.extend(message_block.pretokenized_chunks)
+    for message_block in results:
+        if message_block.pretokenized_chunks is None:
+            msg = f"worker-{message_block.idx} 处理失败,info:{message_block.msg}"
+            logger.info(msg)
+        else:
+            all_word_freq.extend(message_block.pretokenized_chunks)
+
     return all_word_freq
 
 
@@ -417,57 +389,63 @@ def train_BPE(
         tuple[dict[int, bytes], list[tuple[bytes, bytes]]]: tokenizer参数，分别为词表和merges
     """
 
+    start_time = time.time()
     vocab: dict[int, bytes] = {}
     merges: list[tuple[bytes, bytes]] = []
     # 1. 初始化词表
     vocab.update({idx: special_token.encode("utf-8")
                  for idx, special_token in enumerate(special_tokens)})
     vocab.update({len(special_tokens)+i: bytes([i]) for i in range(256)})
-    # 2. 预分词
-    start_time = time.time()
+    # 使用进程池避免重复创建进程开销，创建进程池
+    # 在这里创建进程池，它只会被创建一次
     num_processes = 4
-    all_word_freq = BPE_train_pretokenize(
-        input_path, special_tokens, num_processes)
-    end_time = time.time()
-    logger.info(f"-----预分词时间：{end_time-start_time}----")
-    # 3. 获取到全部分块的预分词结果之后（每个单词以及出现频率）迭代进行merge
-    vocab_len = len(vocab)
-    i = 0
-    near_bytes_freq = defaultdict(int)
-    # 优化之后：每次完成merge不需要重新统计相邻bytes的频率，而是每次merge完成后只是对相关的进行修改即可
-    # 初始统计一次
-    start_time = time.time()
-    for idx, block_word_freq in enumerate(all_word_freq):
-        # 统计分块的相邻字节出现频率
-        for word, freq in block_word_freq.items():
-            for byte1, byte2 in zip(word, word[1:]):
-                near_bytes_freq[(byte1, byte2)] += freq
-    end_time = time.time()
-    logger.info(f"-----相邻字节对频率统计时间：{end_time-start_time}-----")
-    while len(vocab) < vocab_size:
-        # 取出出现频率最高的字节对
-        max_near_bytes = max(near_bytes_freq.keys(),
-                             key=lambda key: (near_bytes_freq.get(key), key[0]+key[1]))
-        new_token = max_near_bytes[0]+max_near_bytes[1]
-        vocab[vocab_len+i] = new_token
-        i += 1
-        merges.append(max_near_bytes)
-        print(max_near_bytes)
+    with Pool(
+        processes=num_processes,
+    ) as shared_pool:  # 将进程池命名为 shared_pool
+        # 2. 预分词
         start_time = time.time()
-        all_word_freq, related_neighbor, new_token_freq = BPE_train_merge(
-            all_word_freq, max_near_bytes, new_token, num_processes)
+        all_word_freq = BPE_train_pretokenize(
+            shared_pool, input_path, special_tokens, num_processes)
         end_time = time.time()
-        logger.info(f"用时：{end_time-start_time}")
-        # 主进程merge之后只对相邻的字节对统计数量进行更新
-        # 1. 首先删除掉merge的字节对的频率
-        near_bytes_freq.pop(max_near_bytes)
-        # 2. 遍历相关的字节对，从原来的统计表中减掉
-        for word, freq in related_neighbor.items():
-            near_bytes_freq[word] -= freq
-            if near_bytes_freq[word] == 0:
-                near_bytes_freq.pop(word)
-        # 3. 将新token相关的字节对更新到原来的统计表中
-        near_bytes_freq.update(new_token_freq)
+        logger.info(
+            f"-----预分词时间：{end_time-start_time}，文档块数：{len(all_word_freq)}----")
+        # 3. 获取到全部分块的预分词结果之后（每个单词以及出现频率）迭代进行merge
+        vocab_len = len(vocab)
+        i = 0
+        near_bytes_freq = defaultdict(int)
+        # 优化之后：每次完成merge不需要重新统计相邻bytes的频率，而是每次merge完成后只是对相关的进行修改即可
+        # 初始统计一次
+        start_time = time.time()
+        for idx, block_word_freq in enumerate(all_word_freq):
+            # 统计分块的相邻字节出现频率
+            for word, freq in block_word_freq.items():
+                for byte1, byte2 in zip(word, word[1:]):
+                    near_bytes_freq[(byte1, byte2)] += freq
+        end_time = time.time()
+        logger.info(f"-----相邻字节对频率统计时间：{end_time-start_time}-----")
+        while len(vocab) < vocab_size:
+            # 取出出现频率最高的字节对
+            max_near_bytes = max(near_bytes_freq.keys(),
+                                 key=lambda key: (near_bytes_freq.get(key), key[0]+key[1]))
+            new_token = max_near_bytes[0]+max_near_bytes[1]
+            vocab[vocab_len+i] = new_token
+            i += 1
+            merges.append(max_near_bytes)
+            all_word_freq, related_neighbor, new_token_freq = BPE_train_merge(
+                shared_pool, all_word_freq, max_near_bytes, new_token, num_processes)
+            # 主进程merge之后只对相邻的字节对统计数量进行更新
+            # 1. 首先删除掉merge的字节对的频率
+            near_bytes_freq.pop(max_near_bytes)
+            # 2. 遍历相关的字节对，从原来的统计表中减掉
+            for word, freq in related_neighbor.items():
+                near_bytes_freq[word] -= freq
+                if near_bytes_freq[word] == 0:
+                    near_bytes_freq.pop(word)
+            # 3. 将新token相关的字节对更新到原来的统计表中
+            near_bytes_freq.update(new_token_freq)
+
+    end_time = time.time()
+    logger.info(f"总耗时：{end_time-start_time}")
     return (vocab, merges)
 
 
@@ -502,6 +480,6 @@ if __name__ == "__main__":
     # input_path = "C:/Projs/assignment1-basics/tests/fixtures/tinystories_sample.txt"
     input_path = "C:/Projs/assignment1-basics/tests/fixtures/corpus.en"
     # input_path = "C:/Projs/assignment1-basics/tests/fixtures/tinystories_sample_5M.txt"
-    vocab, merges = train_BPE(input_path, 500, ["<|endoftext|>"])
-    print(sorted([vocab.get(i)
-          for i in range(257, len(vocab))]))
+    vocab, merges = train_BPE(
+        input_path, 500, ["<|endoftext|>"], num_processes=4)
+    print(vocab)
