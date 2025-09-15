@@ -21,6 +21,7 @@ def test_train_bpe_speed():
         special_tokens=["<|endoftext|>"],
     )
     end_time = time.time()
+    print(f"测试用时：{end_time-start_time}")
     assert end_time - start_time < 1.5
 
 
@@ -53,7 +54,8 @@ def test_train_bpe():
     with open(reference_vocab_path, encoding="utf-8") as f:
         gpt2_reference_vocab = json.load(f)
         reference_vocab = {
-            gpt2_vocab_index: bytes([gpt2_byte_decoder[token] for token in gpt2_vocab_item])
+            gpt2_vocab_index: bytes([gpt2_byte_decoder[token]
+                                    for token in gpt2_vocab_item])
             for gpt2_vocab_item, gpt2_vocab_index in gpt2_reference_vocab.items()
         }
     # Rather than checking that the vocabs exactly match (since they could
@@ -75,7 +77,8 @@ def test_train_bpe_special_tokens(snapshot):
     )
 
     # Check that the special token is not in the vocab
-    vocabs_without_specials = [word for word in vocab.values() if word != b"<|endoftext|>"]
+    vocabs_without_specials = [
+        word for word in vocab.values() if word != b"<|endoftext|>"]
     for word_bytes in vocabs_without_specials:
         assert b"<|" not in word_bytes
 

@@ -1,4 +1,5 @@
 # 导入 Self 用于类型提示，List 用于清晰表示列表类型
+import debugpy
 from typing import Self, Optional, List, Iterable, Iterator, BinaryIO
 import tiktoken
 from abc import ABC
@@ -6,6 +7,7 @@ from dataclasses import dataclass, field
 from collections import defaultdict
 import os
 import time
+import heapq
 import regex as re
 from multiprocessing import Process, Queue, Pool
 import logging
@@ -130,6 +132,56 @@ newest newest newest newest newest newest"""
 
 
 @dataclass
+class LinkedNode:
+    value: bytes = None
+    preNode: Self = None
+    nextNode: Self = None
+
+    def __str__(self):
+        node = self
+        nodeStr = b""
+        while node is not None:
+            nodeStr += node.value
+            nodeStr += b"-"
+            node = node.nextNode
+        return nodeStr.decode("utf-8")[:-1]
+
+
+@dataclass
+class PairInStr:
+    string: str = None
+    # count用于计数这个pair在str中出现了多少次，如果次数为0那么需要跳过
+    count: int = 0
+
+    def __hash__(self) -> int:
+        return self.string.__hash__()
+
+    def __eq__(self, other) -> bool:
+        return self.string == other.string
+
+
+@dataclass
+class PairItem:
+    """_summary_
+    封装了字节对，字节对数量以及字节对比较方式，方便使用堆取出最大的元素
+    """
+    pair: tuple[bytes, bytes] = None
+    count: int = 0
+
+    def __lt__(self, other):
+        # 优先比较count数量,由于python中的heapq是小顶堆，需要把判断翻转
+        if self.count != other.count:
+            return self.count > other.count
+        # count数量相同比较两个字节的字典序
+        if self.pair[0] != other.pair[0]:
+            return self.pair[0] > other.pair[0]
+        return self.pair[1] > other.pair[1]
+
+    def __eq__(self, other):
+        return self.count == other.count and self.pair[0] == other.pair[0] and self.pair[1] == other.pair[1]
+
+
+@dataclass
 class ProcessMessageBlock:
     # 子进程编号
     idx: int = 0
@@ -142,7 +194,7 @@ class ProcessMessageBlock:
     # 子进程处理区间终点
     end: Optional[int] = None
     # pretokenize返回多个分块的预分词结果
-    pretokenized_chunks: List[defaultdict] = None
+    pretokenized_chunks: defaultdict = None
     # BPE Train merge过程子进程返回多个分块的merge结果
     merged_chunks: List[defaultdict] = None
     # merge过程中统计相邻字节对出现数据
@@ -160,7 +212,7 @@ class ProcessMessageBlock:
         self.process_time = process_time
         return self
 
-    def set_pretokenized_chunks(self, pretokenized_chunks: List[defaultdict]) -> Self:
+    def set_pretokenized_chunks(self, pretokenized_chunks: defaultdict) -> Self:
         """设置预分词块，并返回自身以便链式调用。"""
         self.pretokenized_chunks = pretokenized_chunks
         return self
@@ -209,146 +261,33 @@ def pretokenize(input_path: str, idx: int, blockes: list[int],  special_tokens) 
         if blockes is None:
             msg = f"worker-{idx} 需要处理的块为空，退出处理"
             return message_block.set_msg(msg)
-        logger.info(f"worker-{idx} 接收到任务，处理：{blockes}")
+        # logger.info(f"worker-{idx} 接收到任务，处理：{blockes}")
         with open(input_path, "rb") as f:
             # 1. 每个进程只需要处理一个块，需要首先使用special_tokens对文本进行分割成多段
             f.seek(blockes[0])
             text_to_split = f.read(blockes[1]-blockes[0]).decode("utf-8")
-            blocks = [string for string in re.split(
-                re.escape("|".join(special_tokens)), text_to_split)]
+            blocks = re.split(
+                re.escape("|".join(special_tokens)), text_to_split)
             if len(blocks) == 0:
                 msg = f"worker-{idx} 需要处理的块为空，退出处理"
-                logger.info(msg)
                 return message_block.set_msg(msg)
             # 2. 分割成多段，对每段进行预分词，每段单独保存
-            multi_block_word_freq = []
+            multi_block_word_freq = defaultdict(int)
             for block in blocks:
-                word_freq = defaultdict(int)
                 for word in re.finditer(
                         r"""'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+""", block):
-
-                    word_freq[tuple((bytes([byte])
-                                    for byte in word.group().encode("utf-8")))] += 1
-                multi_block_word_freq.append(word_freq)
+                    # 需要加上去掉\r，否则会出现问题
+                    multi_block_word_freq[word.group(0).replace('\r', '')] += 1
             msg = "处理成功"
             message_block.set_msg(
                 msg).set_pretokenized_chunks(multi_block_word_freq)
     except Exception as e:
         msg = f"处理过程异常:{e}"
-        logger.info(f"worker-{idx} {msg}")
         message_block.set_msg(msg)
     return message_block
 
 
-def merge(word_freq: list[defaultdict[int]], pair: tuple[bytes, bytes], new_token: bytes, related_pair_count: defaultdict[int], new_token_freq: defaultdict[int]) -> tuple[list[defaultdict[int]]]:
-    """_summary_
-    merge单个文档分块的词频表
-    Args:
-        word_freq (list[defaultdict[int]]): 单个文档分块的词频表
-        pair (tuple[bytes, bytes]): 需要merge的字节对
-        new_token (bytes): merge之后的新token
-    """
-    new_word_freq = defaultdict(int)
-    for word, freq in word_freq.items():
-        i = 0
-        new_word = []
-        while i < len(word):
-            if i < len(word)-1 and word[i] == pair[0] and word[i+1] == pair[1]:
-                new_word.append(new_token)
-                # 统计和merge的字节对相邻的字节对
-                if related_pair_count is not None:
-                    if i > 0:
-                        related_pair_count[(word[i-1], word[i])] += freq
-                    if i+1 < len(word)-1:
-                        related_pair_count[(word[i+1], word[i+2])] += freq
-                i += 2
-            else:
-                new_word.append(word[i])
-                i += 1
-            # 不仅需要统计相邻的字节对，还需要统计新token相邻字节对
-            last_index = len(new_word)-1
-            if last_index > 0:
-                if new_word[last_index-1] == new_token or new_word[last_index] == new_token:
-                    new_token_freq[(new_word[last_index-1],
-                                    new_word[last_index])] += freq
-        new_word_freq[tuple(new_word)] = freq
-    return new_word_freq
-
-
-def merge_blocks(idx: int, start: int, end: int, word_freqs: list[defaultdict[int]], pair: tuple[bytes, bytes], new_token: bytes, ) -> tuple[int, int, list]:
-    """_summary_
-    单个子进程进行merge操作
-    Args:
-        word_freq (list[defaultdict[int]]): 原词频表
-        pair (tuple[bytes, bytes]): 需要替换的字节对
-        new_token (bytes): 替换之后的新字节
-
-    Returns:
-        _type_: _description_
-    """
-
-    start_time = time.time()
-    # 单个进程merge优化：merge时可以获取到和需要merge的bytes相关的pair，主进程整合子进程相关pair的数量，并根据这个数量修改词频统计表
-    message_block = ProcessMessageBlock(idx=idx, start=start, end=end)
-    # 和需要合并的pair相的字节对数量
-    near_byte_count = defaultdict(int)
-    # 包含新token的字节对统计
-    new_token_freq = defaultdict(int)
-    try:
-        new_word_freqs = []
-        for word_freq in word_freqs:
-            new_word_freqs.append(
-                merge(word_freq, pair, new_token, near_byte_count, new_token_freq))
-        message_block.set_merged_chunks(
-            new_word_freqs).set_near_bytes(near_byte_count).set_new_token_freq(new_token_freq)
-    except Exception as e:
-        msg = f"worker-{idx} 处理过程异常:{e}"
-        message_block.set_msg(msg)
-    end_time = time.time()
-    return message_block.set_process_time(end_time-start_time)
-
-
-def BPE_train_merge(pool, all_word_freq: list, pair: tuple[bytes, bytes], new_token: bytes, num_processes: int):
-    """
-    多进程对所有块进行merge操作
-    """
-    # 1. 计算出每个进程需要处理的block，块数少于进程数使用块数个进程
-    num_block = len(all_word_freq)
-    num_processes = min(num_block, num_processes)
-    if num_processes == 0:
-        logger.info("进程数量或者总块数为0")
-    block_per_process = num_block // num_processes
-    indices = [block_per_process*i for i in range(num_processes+1)]
-    indices[-1] = len(all_word_freq)
-    # 2. 调用多个进程进行merge操作 定位到问题：每次都重新创建进程，时间开销大
-    # 2.1 创建消息队列
-    # 2.2 创建多个进程，每个进程分配任务
-    results = pool.starmap(merge_blocks, [(i, indices[i], indices[i+1], all_word_freq[indices[i]:indices[i+1]], pair, new_token, )
-                                          for i in range(num_processes)])
-    # 2.3 主进程将子进程返回结果更新到结果中
-    all_word_freq = []
-    near_bytes = defaultdict(int)
-    new_token_freq = defaultdict(int)
-    for message_block in results:
-        if message_block.merged_chunks is None:
-            msg = f"worker-{message_block.idx} merge失败"
-            logger.info(msg)
-        else:
-            all_word_freq.extend(message_block.merged_chunks)
-        sub_near_bytes = message_block.near_bytes
-        if sub_near_bytes is not None:
-            for word, freq in sub_near_bytes.items():
-                near_bytes[word] += freq
-        sub_new_token_freq = message_block.new_token_freq
-        if sub_new_token_freq is not None:
-            for word, freq in sub_new_token_freq.items():
-                new_token_freq[word] += freq
-
-    # 3. 返回结果
-    return (all_word_freq, near_bytes, new_token_freq)
-
-
-def BPE_train_pretokenize(pool, input_path: str, special_tokens: list[str], num_processes: int = 4, ) -> list[defaultdict[int]]:
+def BPE_train_pretokenize(pool, input_path: str, special_tokens: list[str], num_processes: int = 4, ) -> tuple[defaultdict[int], defaultdict[LinkedNode]]:
     """
     多进程完成BPE预分词
     """
@@ -357,19 +296,32 @@ def BPE_train_pretokenize(pool, input_path: str, special_tokens: list[str], num_
         boundaries = find_chunk_boundaries(f, num_processes, b"<|endoftext|>")
     # 2. 使用多个进程并行处理，进行预分词
     # 2.1 为每个进程分配任务
-    data_queue = Queue()
     results = pool.starmap(pretokenize, [(input_path,
                                           i, boundaries[i:min(i+2, len(boundaries))] if i < len(boundaries)-1 else None,  special_tokens) for i in range(num_processes)])
-    # 2.3 主进程监听消息队列，从消息队列中持续取出元素,子进程处理完成后会放入None，
-    all_word_freq = []
+    # 2.3 使用进程池就不需要持续监听消息队列，直接遍历results即可
+    all_word_freq = defaultdict(int)
     for message_block in results:
         if message_block.pretokenized_chunks is None:
             msg = f"worker-{message_block.idx} 处理失败,info:{message_block.msg}"
             logger.info(msg)
         else:
-            all_word_freq.extend(message_block.pretokenized_chunks)
-
-    return all_word_freq
+            processed_result = message_block.pretokenized_chunks
+            for word in processed_result:
+                all_word_freq[word] += processed_result[word]
+    # 2.4 从每个进程拿到的是str以及对应的出现频率，上面已经汇总了结果，下面需要建立起对应的双向链表方便后续merge
+    word_list = defaultdict(LinkedNode)
+    for word, _ in all_word_freq.items():
+        preNode = None
+        for byte in word.encode("utf-8"):
+            node = LinkedNode()
+            node.value = bytes([byte])
+            node.preNode = preNode
+            if preNode is None:
+                word_list[word] = node
+            else:
+                preNode.nextNode = node
+            preNode = node
+    return all_word_freq, word_list
 
 
 def train_BPE(
@@ -388,64 +340,131 @@ def train_BPE(
     Returns:
         tuple[dict[int, bytes], list[tuple[bytes, bytes]]]: tokenizer参数，分别为词表和merges
     """
+    def updatePair(pair, delta, string):
+        """_summary_
+
+        辅助函数，修改pair的count以及出现的字符串 
+        """
+        near_bytes_count[pair] += delta
+        if delta < 0:
+            # 无论如何，只要 delta < 0，这个 string 就不再包含这个 pair
+            # 所以从 set 中移除它
+            # 这里有问题，因为一个字符串中可能出现多次pair，因此不能直接将字符串丢弃
+            pair_exist_str[pair][string] -= 1  # 这里已经做了
+        if near_bytes_count[pair] <= 0:
+            # 如果频率为0或负数，说明这个 pair 已经不再有效
+            # 此时应该从 near_bytes_count 和 pair_exist_str 中彻底移除
+            near_bytes_count.pop(pair, None)  # 使用 .pop(key, None) 防止 KeyErorr
+            pair_exist_str.pop(pair, None)  # 同时移除 pair_exist_str 中的对应项
+        elif delta > 0:
+            # 只有在 delta > 0 且 pair 频率仍然有效时，才添加到 set
+            pair_exist_str[pair][string] += 1
+        # 日志记录
+        # logger.info(
+        #     f"Updated pair {pair}: delta={delta}, pre_count={pre_count},new_count={near_bytes_count.get(pair, 0)}, string={string},string_freq={all_word_freq[string]}")
 
     start_time = time.time()
     vocab: dict[int, bytes] = {}
     merges: list[tuple[bytes, bytes]] = []
-    # 1. 初始化词表
-    vocab.update({idx: special_token.encode("utf-8")
+    # 1. 初始化词表,为了和测试用例相符，需要调换顺序，先放256个bytes，再放特殊token
+    vocab.update({i: bytes([i]) for i in range(256)})
+    vocab_len = len(vocab)
+    vocab.update({vocab_len+idx: special_token.encode("utf-8")
                  for idx, special_token in enumerate(special_tokens)})
-    vocab.update({len(special_tokens)+i: bytes([i]) for i in range(256)})
     # 使用进程池避免重复创建进程开销，创建进程池
     # 在这里创建进程池，它只会被创建一次
     num_processes = 4
     with Pool(
         processes=num_processes,
     ) as shared_pool:  # 将进程池命名为 shared_pool
-        # 2. 预分词
+        # 2. 预分词，预分词结果为所有单词的频率以及每个单词对应的双向链表
         start_time = time.time()
-        all_word_freq = BPE_train_pretokenize(
+        all_word_freq, word_list = BPE_train_pretokenize(
             shared_pool, input_path, special_tokens, num_processes)
         end_time = time.time()
         logger.info(
             f"-----预分词时间：{end_time-start_time}，文档块数：{len(all_word_freq)}----")
-        # 3. 获取到全部分块的预分词结果之后（每个单词以及出现频率）迭代进行merge
-        vocab_len = len(vocab)
-        i = 0
-        near_bytes_freq = defaultdict(int)
-        # 优化之后：每次完成merge不需要重新统计相邻bytes的频率，而是每次merge完成后只是对相关的进行修改即可
-        # 初始统计一次
+        # 3. 统计相邻字节对频率，需要遍历每个单词对应的双向链表，同时需要统计每个字节对出现的单词【关键优化】
         start_time = time.time()
-        for idx, block_word_freq in enumerate(all_word_freq):
-            # 统计分块的相邻字节出现频率
-            for word, freq in block_word_freq.items():
-                for byte1, byte2 in zip(word, word[1:]):
-                    near_bytes_freq[(byte1, byte2)] += freq
+        near_bytes_count = defaultdict(int)
+        pair_exist_str = defaultdict(lambda: defaultdict(int))
+        for word, head in word_list.items():
+            while head.nextNode is not None:
+                pair = (head.value, head.nextNode.value)
+                near_bytes_count[pair] += all_word_freq[word]
+                pair_str_count = pair_exist_str[pair][word]
+                pair_exist_str[pair][word] = pair_str_count+1
+                head = head.nextNode
         end_time = time.time()
-        logger.info(f"-----相邻字节对频率统计时间：{end_time-start_time}-----")
-        while len(vocab) < vocab_size:
-            # 取出出现频率最高的字节对
-            max_near_bytes = max(near_bytes_freq.keys(),
-                                 key=lambda key: (near_bytes_freq.get(key), key[0]+key[1]))
-            new_token = max_near_bytes[0]+max_near_bytes[1]
-            vocab[vocab_len+i] = new_token
-            i += 1
-            merges.append(max_near_bytes)
-            all_word_freq, related_neighbor, new_token_freq = BPE_train_merge(
-                shared_pool, all_word_freq, max_near_bytes, new_token, num_processes)
-            # 主进程merge之后只对相邻的字节对统计数量进行更新
-            # 1. 首先删除掉merge的字节对的频率
-            near_bytes_freq.pop(max_near_bytes)
-            # 2. 遍历相关的字节对，从原来的统计表中减掉
-            for word, freq in related_neighbor.items():
-                near_bytes_freq[word] -= freq
-                if near_bytes_freq[word] == 0:
-                    near_bytes_freq.pop(word)
-            # 3. 将新token相关的字节对更新到原来的统计表中
-            near_bytes_freq.update(new_token_freq)
-
+        logger.info(
+            f"-----相邻字节对统计时间：{end_time-start_time}----")
+        # 4. 进行merge
+        # 4.1 建堆，使用自定义类封装pair和比较的逻辑，使用堆取出数量最多的pair，注意取出的pair可能是过时的，需要判断
+        start_time = time.time()
+        heap = []
+        for pair, freq in near_bytes_count.items():
+            item = PairItem(pair=pair, count=freq)
+            heapq.heappush(heap, item)
+        end_time = time.time()
+        logger.info(
+            f"-----建堆时间：{end_time-start_time}----")
+        vocab_len = len(vocab)
+        nums_to_merge = vocab_size - vocab_len
+        start_time = time.time()
+        idx = 0
+        while idx < nums_to_merge:
+            item: PairItem = heapq.heappop(heap)
+            pair = item.pair
+            # 堆中的数据可能会过时，因此取出的时候需要进行比对
+            if item.count != near_bytes_count[pair]:
+                continue
+            # 没过期就进行merge
+            # 4.2 针对相关的单词遍历双向链表进行merge，merge过程中修改相邻字节对数量，字节对出现字符串，将
+            # 出现修改的pair重新放进堆中
+            new_token = pair[0]+pair[1]
+            merges.append(pair)
+            vocab[vocab_len+idx] = new_token
+            related_strs = list(pair_exist_str[pair].keys())
+            for string in related_strs:
+                # 说明pair在该字符串中没有出现了
+                if pair_exist_str[pair][string] == 0:
+                    continue
+                node: LinkedNode = word_list[string]
+                str_freq = all_word_freq[string]
+                while node is not None and node.nextNode is not None:
+                    nextNode = node.nextNode
+                    if node.value == pair[0] and nextNode.value == pair[1]:
+                        node.value = new_token
+                        node.nextNode = nextNode.nextNode
+                        # 需要修改的内容：1. 相邻字节对频率统计表 2. 字节对出现字符串统计表 3. 修改之后重新放进堆中
+                        updatePair(pair, -str_freq, string)
+                        if node.preNode is not None:
+                            prePair = (node.preNode.value, pair[0])
+                            newPair = (node.preNode.value, new_token)
+                            updatePair(prePair, -str_freq, string)
+                            updatePair(newPair, str_freq, string)
+                            heapq.heappush(heap, PairItem(
+                                prePair, near_bytes_count[prePair]))
+                            heapq.heappush(heap, PairItem(
+                                newPair, near_bytes_count[newPair]))
+                        if nextNode.nextNode is not None:
+                            nextNode.nextNode.preNode = node
+                            nexPair = (pair[1], nextNode.nextNode.value)
+                            newPair = (new_token, nextNode.nextNode.value)
+                            updatePair(nexPair, -str_freq, string)
+                            updatePair(newPair, str_freq, string)
+                            heapq.heappush(heap, PairItem(
+                                nexPair, near_bytes_count[nexPair]))
+                            heapq.heappush(heap, PairItem(
+                                newPair, near_bytes_count[newPair]))
+                        continue
+                    node = node.nextNode
+            near_bytes_count.pop(pair, 0)
+            pair_exist_str.pop(pair, None)
+            idx += 1
     end_time = time.time()
-    logger.info(f"总耗时：{end_time-start_time}")
+    logger.info(
+        f"-----merge时间：{end_time-start_time}----")
     return (vocab, merges)
 
 
@@ -479,6 +498,7 @@ if __name__ == "__main__":
     # BPE_train_example()
     # input_path = "C:/Projs/assignment1-basics/tests/fixtures/tinystories_sample.txt"
     input_path = "C:/Projs/assignment1-basics/tests/fixtures/corpus.en"
+    # input_path = "C:/Projs/assignment1-basics/cs336_basics/article.txt"
     # input_path = "C:/Projs/assignment1-basics/tests/fixtures/tinystories_sample_5M.txt"
     vocab, merges = train_BPE(
         input_path, 500, ["<|endoftext|>"], num_processes=4)
