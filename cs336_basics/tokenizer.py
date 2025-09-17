@@ -134,6 +134,7 @@ newest newest newest newest newest newest"""
 @dataclass
 class LinkedNode:
     value: bytes = None
+    token_id: int = 0
     preNode: Self = None
     nextNode: Self = None
 
@@ -248,7 +249,7 @@ class ProcessMessageBlock:
         return self
 
 
-def pretokenize(input_path: str, idx: int, blockes: list[int],  special_tokens) -> list[defaultdict]:
+def train_chunk_pretokenize(input_path: str, idx: int, blockes: list[int],  special_tokens) -> list[defaultdict]:
     """_summary_
 
     Args:
@@ -296,8 +297,8 @@ def BPE_train_pretokenize(pool, input_path: str, special_tokens: list[str], num_
         boundaries = find_chunk_boundaries(f, num_processes, b"<|endoftext|>")
     # 2. 使用多个进程并行处理，进行预分词
     # 2.1 为每个进程分配任务
-    results = pool.starmap(pretokenize, [(input_path,
-                                          i, boundaries[i:min(i+2, len(boundaries))] if i < len(boundaries)-1 else None,  special_tokens) for i in range(num_processes)])
+    results = pool.starmap(train_chunk_pretokenize, [(input_path,
+                                                      i, boundaries[i:min(i+2, len(boundaries))] if i < len(boundaries)-1 else None,  special_tokens) for i in range(num_processes)])
     # 2.3 使用进程池就不需要持续监听消息队列，直接遍历results即可
     all_word_freq = defaultdict(int)
     for message_block in results:
@@ -479,19 +480,139 @@ class BPETokenizer:
     def __init__(self, vocab: dict[int, bytes], merges: list[tuple[bytes, bytes]], special_tokens: list[str] | None = None):
         self.vocab = vocab
         self.merges = merges
-        self.special_tokens = special_tokens
+        self.special_tokens = set(special_tokens)
+        self.stoi = self.reverse_vocab(vocab)
+
+    def reverse_vocab(vocab):
+        stoi = defaultdict(int)
+        for key, value in vocab.items():
+            stoi[value] = key
+        return stoi
 
     def from_files(cls, vocab_filepath: str, merges_filepath: str, special_tokens: list[str] | None = None):
-        pass
+        """_summary_
+
+        Args:
+            vocab_filepath (str): _description_
+            merges_filepath (str): _description_
+            special_tokens (list[str] | None, optional): _description_. Defaults to None.
+        由于不知道文件格式就当成json文件去读取
+        """
+        with open(vocab_filepath, "r", encoding="utf-8") as f:
+            import json
+            vocab_data = json.load(f)
+            # 确保vocab的键是整数（JSON会将其转换为字符串）
+            cls.vocab = {int(k): v.encode('utf-8') if isinstance(v, str) else v
+                         for k, v in vocab_data.items()}
+        cls.stoi = cls.reverse_vocab(vocab)
+
+        cls.merges: list[tuple[bytes, bytes]] = []
+        with open(merges_filepath, "r", encoding="utf-8") as f1:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                pairs = line.split(" ")
+                # 将两个token转换为bytes
+                token1, token2 = pairs[0].encode(
+                    'utf-8'), pairs[1].encode('utf-8')
+                cls.merges.append((token1, token2))
+
+        cls.special_tokens = set(special_tokens)
+        return cls
+
+    def pretokenize(self, text) -> list[str]:
+        result = []
+        for word in re.finditer(
+                r"""'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+""", text):
+            # 需要加上去掉\r，否则会出现问题
+            result.append(word.group(0).replace('\r', ''))
+        return result
 
     def encode(self, text: str) -> list[int]:
-        pass
+        # 1. 按照special token对文本进行分块
+        blocks = re.split(
+            '(' + '|'.join(map(re.escape, self.special_tokens)) + ')', text)
+        # 2. 针对每个block进行预分词
+        # 按顺序存放每个单词以及special token
+        blocks_list = []
+        for block in blocks:
+            if block in self.special_tokens:
+                blocks_list.append(block)
+            else:
+                blocks_list.extend(self.pretokenize(block))
+        # 3. 预分词之后对每个block转换成bytes的形式，便于merge
+        # 使用一个字典存放所有单词，避免重复运算
+        word_list = defaultdict(LinkedNode)
+        for word in blocks_list:
+            if word in self.special_tokens:
+                continue
+            node: LinkedNode = word_list[word]
+            # 对每个词建立一个唯一的链表
+            for byte in word.encode("utf-8"):
+                node.value = byte
+                node.token_id = self.stoi[byte]
+                newNode = LinkedNode()
+                node.nextNode = newNode
+                newNode.preNode = node
+                node = newNode
+            node.preNode.nextNode = None
+        # 4. 完成merge，需要遍历merges，每个merge对对所有单词进行merge
+        # 当前算法低效的点在于对于每个merge对遍历了全部的单词，不知道后续是不是有更高效的做法或者有更好的数据结构
+        for pair in self.merges:
+            for word, head in word_list.items():
+                node: LinkedNode = head
+                while node is not None and node.nextNode is not None:
+                    nextNode = node.nextNode
+                    if node.value == pair[0] and nextNode.value == pair[1]:
+                        # 需要将这对进行merge
+                        newValue = pair[0]+pair[1]
+                        node.value = newNode
+                        node.token_id = self.stoi[newValue]
+                        node.nextNode = nextNode.nextNode
+                        if nextNode.nextNode is not None:
+                            nextNode.nextNode.preNode = node
+                        continue
+                    node = node.nextNode
+        # 5. merge完成之后收集结果到列表中
+        encoded_result = []
+        for word in blocks_list:
+            # 特殊token直接添加
+            if word in self.special_tokens:
+                encoded_result.append(self.stoi(word.encode("utf-8")))
+            else:
+                head: LinkedNode = word_list[word]
+                while head is not None:
+                    encoded_result.append(head.token_id)
+                    head = head.nextNode
+        return encoded_result
 
     def encode_iterable(self, iterable: Iterable[str]) -> Iterator[int]:
-        pass
+        # encode_iterable思路比较简单，就是一个个单词去编码
+        for word in iterable:
+            print(word)
+            # # 特殊token直接返回
+            # if word in self.special_tokens:
+            #     yield self.stoi[word]
+            # else:
 
     def decode(self, ids: list[int]) -> str:
-        pass
+        # 1. 将token IDs转换为字节序列
+        byte_sequence = b''
+        for token_id in ids:
+            if token_id in vocab:
+                byte_sequence += vocab[token_id]
+            else:
+                # 处理未知token ID，可以添加替换字节或抛出错误
+                continue
+
+        # 2. 将字节序列解码为字符串，自动处理错误
+        try:
+            text = byte_sequence.decode('utf-8', errors='replace')
+        except Exception as e:
+            logger.error(str(e))
+
+        return text
 
 
 if __name__ == "__main__":
@@ -502,4 +623,8 @@ if __name__ == "__main__":
     # input_path = "C:/Projs/assignment1-basics/tests/fixtures/tinystories_sample_5M.txt"
     vocab, merges = train_BPE(
         input_path, 500, ["<|endoftext|>"], num_processes=4)
-    print(vocab)
+    # print(vocab)
+    test_str = "nihaoa<|endoftext|>你好<|endoftext|>ni"
+    blocks = re.split(
+        '(' + '|'.join(map(re.escape, ["<|endoftext|>"])) + ')', test_str)
+    print(blocks)
