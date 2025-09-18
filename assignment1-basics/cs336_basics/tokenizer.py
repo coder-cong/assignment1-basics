@@ -1,5 +1,4 @@
 # 导入 Self 用于类型提示，List 用于清晰表示列表类型
-import debugpy
 from typing import Self, Optional, List, Iterable, Iterator, BinaryIO
 import tiktoken
 from abc import ABC
@@ -476,7 +475,7 @@ class BPETokenizerParam:
     special_tokens: list[str] | None = None
 
 
-class BPETokenizer:
+class SlowBPETokenizer:
     def __init__(self, vocab: dict[int, bytes], merges: list[tuple[bytes, bytes]], special_tokens: list[str] | None = None):
         self.vocab = vocab
         self.merges = merges
@@ -535,8 +534,9 @@ class BPETokenizer:
     def encode(self, text: str) -> list[int]:
         # 1. 按照special token对文本进行分块，这里有个问题，如果special tokens为空，那么正则表达式切分的效果是按照每个英文字母进行切分
         if len(self.special_tokens)!=0:
+            # TODO 这里由于|会优先匹配前面的，因此如果<s>在<s><s>前面就会把<s><s>拆成两个，因此这里先排序
             blocks = re.split(
-            '(' + '|'.join(map(re.escape, self.special_tokens)) + ')', text)
+            '(' + '|'.join(map(re.escape, sorted(list(self.special_tokens),key=len,reverse=True))) + ')', text)
         else:
             blocks = [text]
         # 2. 针对每个block进行预分词
