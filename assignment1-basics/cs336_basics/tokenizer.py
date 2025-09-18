@@ -480,10 +480,13 @@ class BPETokenizer:
     def __init__(self, vocab: dict[int, bytes], merges: list[tuple[bytes, bytes]], special_tokens: list[str] | None = None):
         self.vocab = vocab
         self.merges = merges
-        self.special_tokens = set(special_tokens)
+        if special_tokens is not None:
+            self.special_tokens = set(special_tokens)
+        else:
+            self.special_tokens = set()
         self.stoi = self.reverse_vocab(vocab)
 
-    def reverse_vocab(vocab):
+    def reverse_vocab(self,vocab):
         stoi = defaultdict(int)
         for key, value in vocab.items():
             stoi[value] = key
@@ -504,7 +507,7 @@ class BPETokenizer:
             # 确保vocab的键是整数（JSON会将其转换为字符串）
             cls.vocab = {int(k): v.encode('utf-8') if isinstance(v, str) else v
                          for k, v in vocab_data.items()}
-        cls.stoi = cls.reverse_vocab(vocab)
+        cls.stoi = cls.reverse_vocab(cls.vocab)
 
         cls.merges: list[tuple[bytes, bytes]] = []
         with open(merges_filepath, "r", encoding="utf-8") as f1:
@@ -530,17 +533,23 @@ class BPETokenizer:
         return result
 
     def encode(self, text: str) -> list[int]:
-        # 1. 按照special token对文本进行分块
-        blocks = re.split(
+        # 1. 按照special token对文本进行分块，这里有个问题，如果special tokens为空，那么正则表达式切分的效果是按照每个英文字母进行切分
+        if len(self.special_tokens)!=0:
+            blocks = re.split(
             '(' + '|'.join(map(re.escape, self.special_tokens)) + ')', text)
+        else:
+            blocks = [text]
         # 2. 针对每个block进行预分词
         # 按顺序存放每个单词以及special token
         blocks_list = []
         for block in blocks:
+            if not block:
+                continue
             if block in self.special_tokens:
                 blocks_list.append(block)
             else:
                 blocks_list.extend(self.pretokenize(block))
+        del blocks
         # 3. 预分词之后对每个block转换成bytes的形式，便于merge
         # 使用一个字典存放所有单词，避免重复运算
         word_list = defaultdict(LinkedNode)
@@ -550,8 +559,9 @@ class BPETokenizer:
             node: LinkedNode = word_list[word]
             # 对每个词建立一个唯一的链表
             for byte in word.encode("utf-8"):
-                node.value = byte
-                node.token_id = self.stoi[byte]
+                # 遍历字节数组得到的byte的值为一个int值，需要转换成字节数组再进行后续操作
+                node.value = bytes([byte])
+                node.token_id = self.stoi[bytes([byte])]
                 newNode = LinkedNode()
                 node.nextNode = newNode
                 newNode.preNode = node
@@ -559,6 +569,7 @@ class BPETokenizer:
             node.preNode.nextNode = None
         # 4. 完成merge，需要遍历merges，每个merge对对所有单词进行merge
         # 当前算法低效的点在于对于每个merge对遍历了全部的单词，不知道后续是不是有更高效的做法或者有更好的数据结构
+        # a.对于每个pair单词中不一定有，可以通过拼接之后判断word中是否存在来判断
         for pair in self.merges:
             for word, head in word_list.items():
                 node: LinkedNode = head
@@ -567,7 +578,8 @@ class BPETokenizer:
                     if node.value == pair[0] and nextNode.value == pair[1]:
                         # 需要将这对进行merge
                         newValue = pair[0]+pair[1]
-                        node.value = newNode
+                        # 这里不小心把nextNode赋值给了value(python不检查类型)
+                        node.value = newValue
                         node.token_id = self.stoi[newValue]
                         node.nextNode = nextNode.nextNode
                         if nextNode.nextNode is not None:
@@ -579,7 +591,7 @@ class BPETokenizer:
         for word in blocks_list:
             # 特殊token直接添加
             if word in self.special_tokens:
-                encoded_result.append(self.stoi(word.encode("utf-8")))
+                encoded_result.append(self.stoi[word.encode("utf-8")])
             else:
                 head: LinkedNode = word_list[word]
                 while head is not None:
@@ -589,19 +601,17 @@ class BPETokenizer:
 
     def encode_iterable(self, iterable: Iterable[str]) -> Iterator[int]:
         # encode_iterable思路比较简单，就是一个个单词去编码
-        for word in iterable:
-            print(word)
-            # # 特殊token直接返回
-            # if word in self.special_tokens:
-            #     yield self.stoi[word]
-            # else:
+        for text in iterable:
+            result = self.encode(text) 
+            for token_id in result:
+                yield token_id
 
     def decode(self, ids: list[int]) -> str:
         # 1. 将token IDs转换为字节序列
         byte_sequence = b''
         for token_id in ids:
-            if token_id in vocab:
-                byte_sequence += vocab[token_id]
+            if token_id in self.vocab:
+                byte_sequence += self.vocab[token_id]
             else:
                 # 处理未知token ID，可以添加替换字节或抛出错误
                 continue
@@ -615,16 +625,22 @@ class BPETokenizer:
         return text
 
 
+
 if __name__ == "__main__":
-    # BPE_train_example()
-    # input_path = "C:/Projs/assignment1-basics/tests/fixtures/tinystories_sample.txt"
-    input_path = "C:/Projs/assignment1-basics/tests/fixtures/corpus.en"
-    # input_path = "C:/Projs/assignment1-basics/cs336_basics/article.txt"
-    # input_path = "C:/Projs/assignment1-basics/tests/fixtures/tinystories_sample_5M.txt"
-    vocab, merges = train_BPE(
-        input_path, 500, ["<|endoftext|>"], num_processes=4)
-    # print(vocab)
-    test_str = "nihaoa<|endoftext|>你好<|endoftext|>ni"
-    blocks = re.split(
-        '(' + '|'.join(map(re.escape, ["<|endoftext|>"])) + ')', test_str)
-    print(blocks)
+    file_path = "/home/cong/Projs/assignment1-basics/cs336_basics/address.txt"
+    with open(file_path,"r",encoding="utf-8") as f:
+        content = f.read()
+    blank_str = ""
+    # unicode_chr = "😊"
+    unicode_chr  = "🙃"
+    ascii_str = "Hello,how are you?"
+    from tests.test_tokenizer import VOCAB_PATH,MERGES_PATH,get_tokenizer_from_vocab_merges_path,test_overlapping_special_tokens
+    # tokenizer = get_tokenizer_from_vocab_merges_path(
+    #     vocab_path=VOCAB_PATH,
+    #     merges_path=MERGES_PATH,
+    #     special_tokens=["<|endoftext|>", "<|endoftext|><|endoftext|>"],
+    # )
+    # test_string = "Hello, how <|endoftext|><|endoftext|> are you?<|endoftext|>"
+    # token_ids = tokenizer.encode(test_string)
+    # decoded = tokenizer.decode(token_ids)
+    test_overlapping_special_tokens()
