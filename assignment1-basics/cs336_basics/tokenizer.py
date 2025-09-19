@@ -522,16 +522,8 @@ class SlowBPETokenizer:
 
         cls.special_tokens = set(special_tokens)
         return cls
-
-    def pretokenize(self, text) -> list[str]:
-        result = []
-        for word in re.finditer(
-                r"""'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+""", text):
-            # 需要加上去掉\r，否则会出现问题
-            result.append(word.group(0).replace('\r', ''))
-        return result
-
-    def encode(self, text: str) -> list[int]:
+    
+    def split_by_special_tokens(self,text)->list[str]:
         # 1. 按照special token对文本进行分块，这里有个问题，如果special tokens为空，那么正则表达式切分的效果是按照每个英文字母进行切分
         if len(self.special_tokens)!=0:
             # TODO 这里由于|会优先匹配前面的，因此如果<s>在<s><s>前面就会把<s><s>拆成两个，因此这里先排序
@@ -549,7 +541,48 @@ class SlowBPETokenizer:
                 blocks_list.append(block)
             else:
                 blocks_list.extend(self.pretokenize(block))
-        del blocks
+        return blocks_list
+
+    def pretokenize(self, text) -> list[str]:
+        result = []
+        for word in re.finditer(
+                r"""'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+""", text):
+            # 需要加上去掉\r，否则会出现问题
+            result.append(word.group(0).replace('\r', ''))
+        return result
+
+    def encode(self,text:str)->list[int]:
+        # return self.slow_encode(text)
+        return self.greedy_match_encode(text)
+
+    def greedy_match_encode(self,text:str)->list[int]:
+        blocks_list = self.split_by_special_tokens(text)
+        result = []
+        for block in blocks_list:
+            if block == "":
+                continue
+            if block in self.special_tokens:
+                result.append(self.stoi[block.encode("utf-8")])
+                continue
+            # 对单词进行贪婪匹配，尽可能匹配最长的
+            block_bytes = block.encode("utf-8")
+            start = 0
+            end = 1
+            while end <= len(block_bytes):
+                sub_str = block_bytes[start:end]
+                if sub_str in self.stoi.keys():
+                    # 这种情况没法再向后贪婪匹配了
+                    if end == len(block_bytes):
+                        result.append(self.stoi[sub_str])
+                    end+=1
+                else:
+                    pre_str = block_bytes[start:end-1]
+                    result.append(self.stoi[pre_str])
+                    start = end-1
+        return result
+
+    def slow_encode(self, text: str) -> list[int]:
+        blocks_list = self.split_by_special_tokens(text)
         # 3. 预分词之后对每个block转换成bytes的形式，便于merge
         # 使用一个字典存放所有单词，避免重复运算
         word_list = defaultdict(LinkedNode)
@@ -601,6 +634,7 @@ class SlowBPETokenizer:
 
     def encode_iterable(self, iterable: Iterable[str]) -> Iterator[int]:
         # encode_iterable思路比较简单，就是一个个单词去编码
+        # iterable里面传入的字符串实际上是一段文本
         for text in iterable:
             result = self.encode(text) 
             for token_id in result:
@@ -634,7 +668,7 @@ if __name__ == "__main__":
     # unicode_chr = "😊"
     unicode_chr  = "🙃"
     ascii_str = "Hello,how are you?"
-    from tests.test_tokenizer import VOCAB_PATH,MERGES_PATH,get_tokenizer_from_vocab_merges_path,test_overlapping_special_tokens
+    from tests.test_tokenizer import VOCAB_PATH,MERGES_PATH,get_tokenizer_from_vocab_merges_path,test_address_matches_tiktoken
     # tokenizer = get_tokenizer_from_vocab_merges_path(
     #     vocab_path=VOCAB_PATH,
     #     merges_path=MERGES_PATH,
@@ -643,4 +677,5 @@ if __name__ == "__main__":
     # test_string = "Hello, how <|endoftext|><|endoftext|> are you?<|endoftext|>"
     # token_ids = tokenizer.encode(test_string)
     # decoded = tokenizer.decode(token_ids)
-    test_overlapping_special_tokens()
+    # test_overlapping_special_tokens()
+    
